@@ -11,6 +11,7 @@ from pyspark.sql import functions as F
 from functools import reduce
 from pyspark.sql import DataFrame
 from pyspark.sql.functions import mean
+from pyspark.sql.functions import rand
 
 class PySparkMissForest:
        """
@@ -55,13 +56,31 @@ class PySparkMissForest:
                                then binary_int_columns should be at least len 1 list""")
             for col_name in binary_int_columns:
                 df = df.withColumn(col_name, df[col_name].cast("string"))
+                
+        # Initialize list to store names of columns converted from binary float to integer
+        binary_float_to_int_cols = []
 
-        # Convert float columns that are binary to Int64 (LongType in PySpark)
+       # Check each float column to see if it's binary, but first sample a subset
         if convert_binary_float:
+            sample_size = 200  # Adjust this based on the data size and distribution
             for field in df.schema.fields:
                 if field.dataType == FloatType():
                     col_name = field.name
-                    df = df.withColumn(col_name, df[col_name].cast(LongType()))
+                    
+                    # Sample the DataFrame
+                    sample_df = df.orderBy(rand()).limit(sample_size)
+                    
+                    # Check distinct values in the sample
+                    distinct_sample_values = sample_df.select(col_name).distinct().rdd.flatMap(lambda x: x).collect()
+                    
+                    # If the sample suggests it's binary, proceed with the full check
+                    if set(distinct_sample_values).issubset({0.0, 1.0}):
+                        distinct_values = df.select(col_name).distinct().rdd.flatMap(lambda x: x).collect()
+                        
+                        if set(distinct_values) == {1.0, 0.0}:
+                            df = df.withColumn(col_name, df[col_name].cast(LongType()))
+                            binary_float_to_int_cols.append(col_name)
+
                     
         # Add an index column to the DataFrame
         df = df.withColumn("row_index", monotonically_increasing_id())
@@ -152,24 +171,43 @@ class PySparkMissForest:
         iter = 0
         while True:
             for c in miss_col:
-                assembler = VectorAssembler(inputCols=[col for col in df.columns if col != c], outputCol="features")
                 
+                ######
+                # Skip if there's no missing value
+                missing_rows_for_c = miss_row_df.\
+                    filter(miss_row_df["missing_col"] == c).select("row_index")
+                if missing_rows_for_c.count() == 0:
+                    continue
+                # Use only the columns that will be imputed for creating the feature vector
+                assembler = VectorAssembler(inputCols=[col for col in impute_cols if col != c], outputCol="features")
+
+        
                 # Decide the estimator based on column type
-                estimator = classifier if c in mappings else regressor
+                if c in mappings or c in binary_float_to_int_cols:
+                    estimator = classifier
+                else:
+                    estimator = regressor
+                
+                # Narrow down DataFrame to only include relevant columns for imputation plus any auxiliary columns
+                narrowed_df = df.select(impute_cols + ["row_index"])
+
                 # Prepare data for training
-                obs_data = df.filter(df[c].isNotNull())
+                obs_data = narrowed_df.join(obs_row_df, on="row_index", how="inner").filter(narrowed_df[c].isNotNull())
                 obs_data = assembler.transform(obs_data)
                 obs_data = obs_data.select(["features", c])
 
+
                 # Fit estimator
                 model = estimator.fit(obs_data)
-                # Predict the missing column with the trained estimator
+                
                 # Prepare data for prediction
-                miss_data = df.filter(df[c].isNull())
+                miss_data = df.join(missing_rows_for_c, on="row_index", how="inner")
                 miss_data = assembler.transform(miss_data)
 
                 # Make predictions
                 predictions = model.transform(miss_data)
+                
+                ######
                 
                 # Extract predictions and join them back to the original DataFrame
                 predicted_values = predictions.select("row_index", "prediction")
@@ -185,7 +223,7 @@ class PySparkMissForest:
                 # Drop the 'prediction' column as it's no longer needed
                 df = df.drop("prediction")
                 
-                # Check if criteria is met
+            # Check if criteria is met
             if iter >= self.n_iter:
                 break
             ###
@@ -193,7 +231,7 @@ class PySparkMissForest:
             relevant_cols = [c for c in df.columns if c in miss_col]
 
             # Count missing values only for relevant columns
-            missing_count_df = df.select([F.sum(F.col(c).isNull().cast("int")).alias(c) for c in relevant_cols]).collect()
+            missing_count_df = df.select([F.sum(F.col(c).isNull().cast("int")).alias(c) for c in impute_cols]).collect()
             missing_count = missing_count_df[0].asDict()
 
             # Identify columns with missing values
@@ -211,16 +249,8 @@ class PySparkMissForest:
         for c, rev_mapping in rev_mappings.items():
             rev_mapping_expr = create_map([lit(x) for x in chain(*rev_mapping.items())])
             df = df.withColumn(c, rev_mapping_expr[df[c]])
-
-        
-
-        # Printing mappings for debugging or logging purposes
-        print("mappings:", mappings)
-        print("rev_mappings:", rev_mappings)
         
         # Drop the index column
         df = df.drop("row_index")
         
         return df
-            
-        
